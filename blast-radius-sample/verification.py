@@ -15,6 +15,8 @@ import subprocess
 import sys
 import zipfile
 
+from benchmark_probe import PROFILE, changed_guard
+
 HERE = Path(__file__).resolve().parent
 SNAPSHOT = HERE / "probe-snapshot.b85"
 RUNNER = HERE / "probe_runner.py"
@@ -27,6 +29,9 @@ PROBE_CPU_LIMIT = 0.35
 MIN_PROBE_CPU = 0.1
 PROBE_TIMEOUT = 1.0
 MAX_PROBES = 5
+BENCHMARK_CPU_BUDGET = 2.0
+BENCHMARK_CPU_LIMIT = 0.85
+BENCHMARK_TIMEOUT = 2.5
 MAX_TESTS = 8
 MAX_TEST_SECONDS = 0.25
 
@@ -139,6 +144,13 @@ class Verification:
         self.working = self.destination / "source"
         self.started_cpu = child_cpu()
         self.probes = 0
+        self.benchmark_cpu = 0.0
+        self.profile = None
+        if PROFILE.is_file():
+            try:
+                self.profile = json.loads(PROFILE.read_text())
+            except (OSError, ValueError):
+                pass
 
     def prepare(self, patch, changes):
         if not changes or any(change.structural or not patchable(path) for path, change in changes.items()):
@@ -167,12 +179,43 @@ class Verification:
         if self.probes >= MAX_PROBES or remaining < MIN_PROBE_CPU:
             return False
         self.probes += 1
+        return self.run(updated, test_ids, min(PROBE_CPU_LIMIT, remaining), PROBE_TIMEOUT)
+
+    def benchmark_queries(self, original, updated, changes):
+        if not self.profile or not (guard := changed_guard(original, updated, changes)):
+            return None
+        path, first, last = guard
+        coverage = self.profile["coverage"].get(Path(path).stem)
+        if not coverage:
+            return None
+        mask = 0
+        for line in range(first, last + 1):
+            mask |= coverage.get(str(line), 0)
+        if not mask:
+            return None
+        return tuple(index for index in range(len(self.profile["digests"])) if mask & (1 << index))
+
+    def benchmark_passes(self, updated, indices):
+        remaining = BENCHMARK_CPU_BUDGET - self.benchmark_cpu
+        if not indices or remaining < MIN_PROBE_CPU:
+            return False
+        before = child_cpu()
+        try:
+            return self.run(
+                updated, ("--benchmark", *map(str, indices)),
+                min(BENCHMARK_CPU_LIMIT, remaining), BENCHMARK_TIMEOUT,
+            )
+        finally:
+            self.benchmark_cpu += child_cpu() - before
+
+    def run(self, updated, test_ids, cpu_limit, timeout):
         if not self.working.exists():
             try:
                 # Copy once so the image's baseline stays read-only.
                 shutil.copytree(self.baseline, self.working)
             except OSError:
                 self.probes = MAX_PROBES
+                self.benchmark_cpu = BENCHMARK_CPU_BUDGET
                 return False
 
         changed_paths = []
@@ -186,8 +229,8 @@ class Verification:
                 changed.write_text(code)
             result = subprocess.run(
                 [sys.executable, "-B", "-S", str(RUNNER), str(self.working),
-                 str(min(PROBE_CPU_LIMIT, remaining)), *test_ids],
-                cwd=self.working, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
+                 str(cpu_limit), *test_ids],
+                cwd=self.working, capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 env={**os.environ, "PYTHONHASHSEED": "0", "SKIP_INTEGRATION": "0"},
             )
@@ -206,6 +249,7 @@ class Verification:
                             shutil.copy2(cached, cache_from_source(str(changed)))
             except OSError:
                 self.probes = MAX_PROBES
+                self.benchmark_cpu = BENCHMARK_CPU_BUDGET
 
 
 if __name__ == "__main__":

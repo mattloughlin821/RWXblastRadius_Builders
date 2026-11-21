@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 
+from benchmark_probe import EXECUTOR_TPCDS
 from class_dependencies import class_dependency_mask
 from verification import Verification, probe_tests
 
@@ -244,8 +245,15 @@ def select(verification) -> None:
     known = impact["files"].keys() | fixtures.keys() | file_readers.keys() | imports.keys() | observers.keys()
     full_suite = best_schedule(tests)
     durations = {test["number"]: test["seconds"] for test in tests}
+    def cost(schedule):
+        return WORKER_COST_MS / 1000 * len(schedule) + max(
+            (sum(durations[number] for number in worker) for worker in schedule),
+            default=0,
+        )
+
     schedules = {}
     probes = []
+    benchmark_probes = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         changes = read_patch(patch)
         if changes and changes.keys() <= known:
@@ -283,12 +291,18 @@ def select(verification) -> None:
                 if not direct_bit or direct_bit & selected or indirect_bit & indirect
             ]
             workers = best_schedule(relevant)
+            if any(test["id"] == EXECUTOR_TPCDS for test in relevant):
+                indices = verification.benchmark_queries(original, updated, changes)
+                if indices is not None:
+                    reduced = best_schedule([test for test in relevant if test["id"] != EXECUTOR_TPCDS])
+                    savings = cost(workers) - cost(reduced)
+                    if savings >= 3.0:
+                        benchmark_probes.append((
+                            savings / (1 + len(indices)), patch.stem, updated, indices, reduced,
+                        ))
             if updated and (test_ids := probe_tests(relevant)):
-                simulated = 2 * len(workers) + max(
-                    sum(durations[number] for number in worker) for worker in workers
-                )
                 estimate = 0.1 + sum(test["seconds"] for test in relevant)
-                probes.append((simulated / estimate, patch.stem, updated, test_ids))
+                probes.append((cost(workers) / estimate, patch.stem, updated, test_ids))
         else:
             workers = full_suite
         schedules[patch.stem] = workers
@@ -296,6 +310,10 @@ def select(verification) -> None:
     for _, commit, updated, test_ids in sorted(probes, key=lambda probe: -probe[0]):
         if verification.all_pass(updated, test_ids):
             schedules[commit] = []
+
+    for _, commit, updated, indices, reduced in sorted(benchmark_probes, key=lambda probe: -probe[0]):
+        if verification.benchmark_passes(updated, indices):
+            schedules[commit] = reduced
 
     for commit, workers in schedules.items():
         print(json.dumps({"commit": commit, "workers": workers}))

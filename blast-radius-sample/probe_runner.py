@@ -27,7 +27,13 @@ def main():
     signal.setitimer(signal.ITIMER_PROF, float(cpu_limit))
     sys.path.insert(0, root)
     with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
-        passed = all(matched_pass(node) for node in test_ids)
+        if test_ids and test_ids[0] == "--benchmark":
+            from benchmark_probe import PROFILE, matched_queries
+
+            profile = json.loads(PROFILE.read_text())
+            passed = matched_queries(profile, [int(index) for index in test_ids[1:]])
+        else:
+            passed = all(matched_pass(node) for node in test_ids)
     print(json.dumps(passed))
 
 
