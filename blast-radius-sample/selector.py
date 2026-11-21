@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 
+from class_dependencies import class_dependency_mask
 from verification import Verification
 
 DATA = Path("/data")
@@ -15,6 +16,7 @@ IMPACT_MAP = Path(__file__).with_name("impact-map.json")
 FIXTURES = Path(__file__).with_name("optimizer-fixtures.json")
 DEPENDENCIES = Path(__file__).with_name("test-dependencies.json")
 ENUM_DOMAINS = Path(__file__).with_name("enum-domains.json")
+CLASS_DOMAINS = Path(__file__).with_name("class-domains.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
@@ -234,6 +236,7 @@ def select(verification) -> None:
     weights = {node_id: 1 << index for index, node_id in enumerate(impact["test_ids"])}
     dependencies = json.loads(DEPENDENCIES.read_text())
     enum_domains = json.loads(ENUM_DOMAINS.read_text())
+    class_domains = json.loads(CLASS_DOMAINS.read_text())
     dependency_weights = {node_id: 1 << index for index, node_id in enumerate(dependencies["test_ids"])}
     weighted_tests = [(weights.get(test["id"], 0), dependency_weights.get(test["id"], 0), test) for test in tests]
     fixtures = {
@@ -250,6 +253,12 @@ def select(verification) -> None:
         changes = read_patch(patch)
         if changes and changes.keys() <= known:
             original, updated = verification.prepare(patch, changes)
+            trivia_paths = {
+                path for path, change in changes.items()
+                if path in impact["files"] and possible_trivia(change)
+                and verification.equivalent(path, original, updated)
+            }
+            isolated = len(changes) - len(trivia_paths) == 1
             selected = 0
             indirect = 0
             for path, change in changes.items():
@@ -260,12 +269,15 @@ def select(verification) -> None:
                     if change.structural:
                         selected |= impact["masks"][impact["files"][path]["full"]]
                         indirect |= imports.get(path, 0)
-                    elif possible_trivia(change) and verification.equivalent(path, original, updated):
+                    elif path in trivia_paths:
                         pass  # Source observers below can still see source-level changes.
-                    elif len(changes) != 1 or path not in enum_domains or not equivalent_enum_edit(
+                    elif not isolated or path not in enum_domains or not equivalent_enum_edit(
                         change, impact["files"][path], enum_domains[path]
                     ):
-                        selected |= source_tests(path, change, impact)
+                        narrowed = None
+                        if isolated:
+                            narrowed = class_dependency_mask(path, change, original, updated, class_domains, impact)
+                        selected |= narrowed if narrowed is not None else source_tests(path, change, impact)
                 else:
                     indirect |= imports.get(path, 0)
                 indirect |= observers.get(path, 0)
