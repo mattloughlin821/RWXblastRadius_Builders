@@ -11,12 +11,14 @@ DATA = Path("/data")
 IMPACT_MAP = Path(__file__).with_name("impact-map.json")
 FIXTURES = Path(__file__).with_name("optimizer-fixtures.json")
 DEPENDENCIES = Path(__file__).with_name("test-dependencies.json")
+ENUM_DOMAINS = Path(__file__).with_name("enum-domains.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
 HUNK_HEADER = re.compile(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
 ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
 DIRECTIVE = re.compile(r"coding[:=]|type:|noqa|pragma:|fmt:", re.IGNORECASE)
+CONDITION = re.compile(r"(\s*)(if |elif |return )(.+?)(:?)")
 
 
 @dataclass
@@ -26,6 +28,9 @@ class FileChange:
     touched: set[int] = field(default_factory=set)
     text: list[str] = field(default_factory=list)
     structural: bool = False
+    old_code: list[tuple[int, str]] = field(default_factory=list)
+    new_code: list[str] = field(default_factory=list)
+    edit_runs: int = 0
 
 
 def read_patch(patch: Path) -> dict[str, FileChange]:
@@ -36,8 +41,9 @@ def read_patch(patch: Path) -> dict[str, FileChange]:
     inserted_run = set()
 
     def finish_run():
-        if current is not None:
+        if current is not None and (removed_run or inserted_run):
             current.touched.update(removed_run or inserted_run)
+            current.edit_runs += 1
         removed_run.clear()
         inserted_run.clear()
 
@@ -65,11 +71,13 @@ def read_patch(patch: Path) -> dict[str, FileChange]:
             removed_run.add(old_line)
             current.removed.add(old_line)
             current.text.append(line[1:])
+            current.old_code.append((old_line, line[1:]))
             old_line += 1
         elif old_line is not None and line.startswith("+"):
             inserted_run.update((old_line - 1, old_line))
             current.inserted.update((old_line - 1, old_line))
             current.text.append(line[1:])
+            current.new_code.append(line[1:])
     finish_run()
     return changes
 
@@ -79,6 +87,52 @@ def union(masks):
     for mask in masks:
         result |= mask
     return result
+
+
+def enum_operand(node, members, fields):
+    if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+        return None
+    name = node.value.id
+    if name == "self":
+        return fields.get(node.attr)
+    if node.attr in members.get(name, ()):
+        return name
+    return None
+
+
+def same_enum_comparison(before, after, members, fields):
+    if "#" in before or "#" in after:
+        return False
+    old = CONDITION.fullmatch(before)
+    new = CONDITION.fullmatch(after)
+    if not old or not new or (old[1], old[2], old[4]) != (new[1], new[2], new[4]):
+        return False
+    try:
+        original, replacement = (ast.parse(match[3], mode="eval").body for match in (old, new))
+    except SyntaxError:
+        return False
+    if not all(isinstance(node, ast.Compare) and len(node.ops) == 1 for node in (original, replacement)):
+        return False
+    operators = frozenset((type(original.ops[0]), type(replacement.ops[0])))
+    if operators not in (frozenset((ast.Is, ast.Eq)), frozenset((ast.IsNot, ast.NotEq))):
+        return False
+    if any(ast.dump(a) != ast.dump(b) for a, b in zip(
+        (original.left, *original.comparators), (replacement.left, *replacement.comparators)
+    )):
+        return False
+    left, right = (enum_operand(node, members, fields) for node in (original.left, original.comparators[0]))
+    return left is not None and left == right
+
+
+def equivalent_enum_edit(change, entry, domain):
+    if change.structural or change.edit_runs != 1 or len(change.old_code) != 1 or len(change.new_code) != 1:
+        return False
+    if (change.removed | change.inserted) & set(entry["unsafe_trivia"]):
+        return False
+    (line, before), = change.old_code
+    after, = change.new_code
+    scopes = [fields for start, end, fields in domain["scopes"] if start < line <= end]
+    return len(scopes) == 1 and same_enum_comparison(before, after, domain["enums"], scopes[0])
 
 
 def changed_bindings(change: FileChange):
@@ -160,6 +214,7 @@ def main() -> None:
     impact = json.loads(IMPACT_MAP.read_text())
     weights = {node_id: 1 << index for index, node_id in enumerate(impact["test_ids"])}
     dependencies = json.loads(DEPENDENCIES.read_text())
+    enum_domains = json.loads(ENUM_DOMAINS.read_text())
     dependency_weights = {node_id: 1 << index for index, node_id in enumerate(dependencies["test_ids"])}
     weighted_tests = [(weights.get(test["id"], 0), dependency_weights.get(test["id"], 0), test) for test in tests]
     fixtures = {
@@ -185,7 +240,9 @@ def main() -> None:
                     if change.structural:
                         selected |= impact["masks"][impact["files"][path]["full"]]
                         indirect |= imports.get(path, 0)
-                    else:
+                    elif len(changes) != 1 or path not in enum_domains or not equivalent_enum_edit(
+                        change, impact["files"][path], enum_domains[path]
+                    ):
                         selected |= source_tests(path, change, impact)
                 else:
                     indirect |= imports.get(path, 0)
