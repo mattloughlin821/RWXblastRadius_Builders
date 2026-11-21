@@ -1,63 +1,132 @@
-"""Select tests using file coverage from the pinned sqlglot baseline."""
+"""Select tests from baseline coverage, source structure, and fixture dependencies."""
 
+import ast
+from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import re
 import sys
-from pathlib import Path
 
 DATA = Path("/data")
-MAP = Path(__file__).with_name("coverage-map.json")
+IMPACT_MAP = Path(__file__).with_name("impact-map.json")
 FIXTURES = Path(__file__).with_name("optimizer-fixtures.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
 HUNK_HEADER = re.compile(r"@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+ASSIGNMENT = re.compile(r"([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)")
+DIRECTIVE = re.compile(r"coding[:=]|type:|noqa|pragma:|fmt:", re.IGNORECASE)
 
 
-def changed_lines(patch: Path, fixture_paths: set[str]) -> dict[str, set[int]]:
-    paths = {}
-    current_path = ""
+@dataclass
+class FileChange:
+    removed: set[int] = field(default_factory=set)
+    inserted: set[int] = field(default_factory=set)
+    touched: set[int] = field(default_factory=set)
+    text: list[str] = field(default_factory=list)
+
+
+def read_patch(patch: Path) -> dict[str, FileChange]:
+    changes = {}
     old_line = None
+    current = None
+    removed_run = set()
+    inserted_run = set()
+
+    def finish_run():
+        if current is not None:
+            current.touched.update(removed_run or inserted_run)
+        removed_run.clear()
+        inserted_run.clear()
+
     for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("diff --git "):
-            old_line = None
+            finish_run()
             header = DIFF_HEADER.fullmatch(line)
             if not header or header[1] != header[2]:
                 return {}
-            current_path = header[1]
-            paths.setdefault(current_path, set())
+            current = changes.setdefault(header[1], FileChange())
+            old_line = None
+        elif line.startswith(("new file mode ", "deleted file mode ", "GIT binary patch", "Binary files ")):
+            return {}
         elif hunk := HUNK_HEADER.match(line):
+            if current is None:
+                return {}
+            finish_run()
             old_line = int(hunk[1])
         elif old_line is not None and line.startswith(" "):
+            finish_run()
             old_line += 1
-        elif old_line is not None and line.startswith(("+", "-")):
-            code = line[1:].expandtabs()
-            if current_path not in fixture_paths:
-                # File coverage can miss effects from module and class initialization.
-                if code.strip() and len(code) - len(code.lstrip()) <= 4:
-                    return {}
-                if line.startswith("-"):
-                    paths[current_path].add(old_line)
-                elif code.strip():
-                    paths[current_path].update((old_line - 1, old_line))
-            if line.startswith("-"):
-                old_line += 1
-    return paths
+        elif old_line is not None and line.startswith("-"):
+            removed_run.add(old_line)
+            current.removed.add(old_line)
+            current.text.append(line[1:])
+            old_line += 1
+        elif old_line is not None and line.startswith("+"):
+            inserted_run.update((old_line - 1, old_line))
+            current.inserted.update((old_line - 1, old_line))
+            current.text.append(line[1:])
+    finish_run()
+    return changes
 
 
-def function_tests(lines: set[int], regions: list, measured: list[str]) -> set[str]:
-    if not lines:
-        return set()
-    candidates = set()
-    for line in lines:
-        matches = [region for region in regions if region[0] < line <= region[1]]
-        if not matches:
-            return set()
-        _, _, indices = min(matches, key=lambda region: region[1] - region[0])
-        if not indices:
-            return set()
-        candidates.update(measured[index] for index in indices)
-    return candidates
+def union(masks):
+    result = 0
+    for mask in masks:
+        result |= mask
+    return result
+
+
+def changed_bindings(change: FileChange):
+    for text in change.text:
+        code = text.strip()
+        if match := ASSIGNMENT.match(code):
+            yield match[1]
+        if code.startswith(("import ", "from ")):
+            try:
+                statement = ast.parse(code).body[0]
+            except (SyntaxError, IndexError):
+                continue
+            if isinstance(statement, (ast.Import, ast.ImportFrom)):
+                for alias in statement.names:
+                    yield alias.asname or alias.name.split(".", maxsplit=1)[0]
+
+
+def source_tests(path, change, impact):
+    entry = impact["files"][path]
+    masks = impact["masks"]
+    touched = change.touched
+    if not touched:
+        return masks[entry["full"]]
+
+    scopes = {
+        min(
+            (region for region in entry["functions"] if region[0] < line <= region[1]),
+            key=lambda region: region[1] - region[0],
+            default=(0, 0, 0),
+        )[0]
+        for line in touched
+    }
+    def scoped_tests():
+        return union(masks[index] for first, _, index in entry["functions"] if first in scopes)
+
+    # Source tokenization rules out comment-looking lines inside strings and continuations.
+    if (change.text and all(
+        text.lstrip().startswith("#") and not text.startswith("#!") and not DIRECTIVE.search(text)
+        for text in change.text
+    ) and not (change.removed | change.inserted) & set(entry["unsafe_trivia"])):
+        return scoped_tests()
+
+    selected = union(masks[entry["lines"].get(str(line), 0)] for line in touched)
+    selected |= union(masks[entry["guards"].get(str(line), 0)] for line in touched)
+    if 0 in scopes:
+        references = impact["references"]
+        related = union(masks[references.get(symbol, 0)] for symbol in changed_bindings(change))
+        source = Path(path)
+        if source.parent.name == "dialects" and source.stem != "dialect":
+            related &= masks[impact["families"].get(source.stem, 0)]
+        selected |= related
+    return selected or scoped_tests() or masks[entry["full"]]
 
 
 def best_schedule(tests: list[dict]) -> list[list[int]]:
@@ -84,41 +153,27 @@ def best_schedule(tests: list[dict]) -> list[list[int]]:
 
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    coverage = json.loads(MAP.read_text())
-    tests_by_path = {path: set(ids) for path, ids in coverage.get("paths", {}).items()}
-    measured_ids = coverage.get("measured", [])
-    measured = set(measured_ids)
-    functions = coverage.get("functions", {})
-    files_by_test_id = {test["id"]: test["file"] for test in tests}
+    impact = json.loads(IMPACT_MAP.read_text())
+    weights = {node_id: 1 << index for index, node_id in enumerate(impact["test_ids"])}
+    weighted_tests = [(weights.get(test["id"], 0), test) for test in tests]
     fixtures = {
-        path: set(ids) & files_by_test_id.keys()
-        for path, ids in json.loads(FIXTURES.read_text()).items()
+        path: union(weights.get(node_id, 0) for node_id in node_ids)
+        for path, node_ids in json.loads(FIXTURES.read_text()).items()
     }
-    fixture_paths = {path for path, ids in fixtures.items() if ids}
-    known_paths = tests_by_path.keys() | fixture_paths
+    fixtures = {path: mask for path, mask in fixtures.items() if mask}
+    known = impact["files"].keys() | fixtures.keys()
     full_suite = best_schedule(tests)
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        lines = changed_lines(patch, fixture_paths)
-        paths = lines.keys()
-        workers = full_suite
-        if paths and paths <= known_paths:
-            fixture_tests = set().union(*(fixtures[path] for path in paths & fixture_paths))
-            direct_tests = set(fixture_tests)
-            covered_files = set()
-            for path in paths - fixture_paths:
-                direct = function_tests(lines[path], functions.get(path, []), measured_ids)
-                if direct:
-                    direct_tests.update(direct)
-                else:
-                    covered_files.update(
-                        files_by_test_id[node] for node in tests_by_path[path] if node in files_by_test_id
-                    )
-            selected = [
-                test for test in tests
-                if test["file"] in covered_files or test["id"] in direct_tests or test["id"] not in measured
-            ]
-            if selected:
-                workers = best_schedule(selected)
+        changes = read_patch(patch)
+        if changes and changes.keys() <= known:
+            selected = union(
+                fixtures[path] if path in fixtures else source_tests(path, change, impact)
+                for path, change in changes.items()
+            )
+            relevant = [test for bit, test in weighted_tests if not bit or bit & selected]
+            workers = best_schedule(relevant)
+        else:
+            workers = full_suite
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(f"{patch.stem}: selected {sum(map(len, workers))} of {len(tests)} tests", file=sys.stderr)
 
