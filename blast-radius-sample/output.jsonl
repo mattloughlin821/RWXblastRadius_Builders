@@ -10,10 +10,10 @@
 {"commit": "6vvp", "workers": [[1383]]}
 {"commit": "6ze8", "workers": [[302]]}
 {"commit": "8y7j", "workers": [[383]]}
-{"commit": "986c", "workers": [[1295, 1454, 1619]]}
-{"commit": "9u5k", "workers": [[855, 639, 205, 845, 844]]}
+{"commit": "986c", "workers": [[1454, 1619]]}
+{"commit": "9u5k", "workers": []}
 {"commit": "ary6", "workers": [[1382, 27, 1355, 1417, 54, 1519, 1420, 42, 1189, 64]]}
-{"commit": "bap8", "workers": [[1584]]}
+{"commit": "bap8", "workers": []}
 {"commit": "bj7g", "workers": [[93, 94]]}
 {"commit": "bvw2", "workers": [[1302]]}
 {"commit": "egys", "workers": [[1434]]}

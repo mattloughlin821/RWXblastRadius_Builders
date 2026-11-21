@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 import re
 import sys
+import tempfile
+
+from verification import Verification
 
 DATA = Path("/data")
 IMPACT_MAP = Path(__file__).with_name("impact-map.json")
@@ -209,7 +212,23 @@ def best_schedule(tests: list[dict]) -> list[list[int]]:
     return best_workers
 
 
-def main() -> None:
+def schedule_cost(tests):
+    durations = {test["number"]: test["seconds"] for test in tests}
+    workers = best_schedule(tests)
+    return 2 * len(workers) + max((sum(durations[number] for number in worker) for worker in workers), default=0)
+
+
+def possible_trivia(change):
+    if not change.text or any(line.lstrip().startswith("#!") or DIRECTIVE.search(line) for line in change.text):
+        return False
+    # This is just a cheap prefilter. An AST comparison checks string contents,
+    # type comments, and indentation before treating an edit as trivia.
+    old = [line.partition("#")[0].strip() for _, line in change.old_code]
+    new = [line.partition("#")[0].strip() for line in change.new_code]
+    return list(filter(None, old)) == list(filter(None, new))
+
+
+def select(verification) -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     impact = json.loads(IMPACT_MAP.read_text())
     weights = {node_id: 1 << index for index, node_id in enumerate(impact["test_ids"])}
@@ -230,6 +249,7 @@ def main() -> None:
     for patch in sorted((DATA / "commits").glob("*.patch")):
         changes = read_patch(patch)
         if changes and changes.keys() <= known:
+            original, updated = verification.prepare(patch, changes)
             selected = 0
             indirect = 0
             for path, change in changes.items():
@@ -240,6 +260,8 @@ def main() -> None:
                     if change.structural:
                         selected |= impact["masks"][impact["files"][path]["full"]]
                         indirect |= imports.get(path, 0)
+                    elif possible_trivia(change) and verification.equivalent(path, original, updated):
+                        pass  # Source observers below can still see source-level changes.
                     elif len(changes) != 1 or path not in enum_domains or not equivalent_enum_edit(
                         change, impact["files"][path], enum_domains[path]
                     ):
@@ -251,11 +273,19 @@ def main() -> None:
                 test for direct_bit, indirect_bit, test in weighted_tests
                 if not direct_bit or direct_bit & selected or indirect_bit & indirect
             ]
+            if relevant:
+                relevant = verification.remove_equivalent_benchmark(original, updated, changes, relevant, schedule_cost)
+                relevant = verification.remove_passing(original, updated, relevant, schedule_cost)
             workers = best_schedule(relevant)
         else:
             workers = full_suite
         print(json.dumps({"commit": patch.stem, "workers": workers}))
         print(f"{patch.stem}: selected {sum(map(len, workers))} of {len(tests)} tests", file=sys.stderr)
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory(prefix="blast-radius-verify-") as destination:
+        select(Verification(destination))
 
 
 if __name__ == "__main__":
