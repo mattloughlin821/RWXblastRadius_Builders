@@ -4,4 +4,4 @@
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 COPY selector.py impact-map.json optimizer-fixtures.json test-dependencies.json enum-domains.json verification.py probe_runner.py probe-snapshot.b85 class_dependencies.py class-domains.json /app/
 RUN python -B -S /app/verification.py
-CMD ["python", "/app/selector.py"]
+CMD ["python", "-B", "-S", "/app/selector.py"]

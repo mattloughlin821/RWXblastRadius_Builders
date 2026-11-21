@@ -2,39 +2,33 @@
 
 import ast
 import base64
+import compileall
+from importlib.util import cache_from_source
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import resource
+import shutil
 import subprocess
 import sys
-import tempfile
-import time
 import zipfile
 
 HERE = Path(__file__).resolve().parent
 SNAPSHOT = HERE / "probe-snapshot.b85"
 RUNNER = HERE / "probe_runner.py"
-FINGERPRINT = HERE / "optimizer-fingerprint.json"
+PROBE_SOURCE = HERE / "probe-source"
 DIFF = re.compile(r"diff --git a/(\S+) b/(\S+)")
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*")
-REPLAY_BUDGET = 8.0
-TIMEOUT = 0.6
-COST_CAP = 0.25
-MAX_REPLAY = 24
-HEAVY_TIMEOUT = 1.6
-FINGERPRINT_TIMEOUT = 3.0
-GENERATOR_MEMORY = "tests/test_generator.py::TestGenerator::test_generator_memory"
-EXECUTOR_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-
-# These rule modules do not supply functions called by the executor or planner
-# after optimize() has returned. Shared scope, annotation, and join modules
-# deliberately stay outside this set.
-RULE_ONLY_MODULES = frozenset({
-    "eliminate_ctes", "eliminate_subqueries", "isolate_table_selects", "merge_subqueries",
-    "optimize_joins", "pushdown_predicates", "pushdown_projections", "unnest_subqueries",
-})
+# Bound actual child CPU, which the grader charges, as well as wall time.
+PROBE_CPU_BUDGET = 0.75
+PROBE_CPU_LIMIT = 0.35
+MIN_PROBE_CPU = 0.1
+PROBE_TIMEOUT = 1.0
+MAX_PROBES = 5
+MAX_TESTS = 8
+MAX_TEST_SECONDS = 0.25
 
 # These are standard unittest modules. Integration and packaging tests require
 # the full grader environment. Test source edits also go through normal selection.
@@ -108,88 +102,51 @@ def apply_diff(text, original):
     return changes
 
 
-def eligible(test):
-    path = test["file"]
-    names = test["id"].split("::")
-    return (
-        test["seconds"] <= COST_CAP and path not in EXCLUDED_MODULES
-        and len(names) == 3 and all(name.isidentifier() for name in names[1:])
-        and path.startswith("tests/") and Path(path).name.startswith("test_")
-    )
+def prepare_source(destination):
+    code = b"".join(SNAPSHOT.read_bytes().split())
+    with zipfile.ZipFile(io.BytesIO(base64.b85decode(code))) as archive:
+        archive.extractall(destination)
+    if not compileall.compile_dir(destination, quiet=1):
+        raise RuntimeError("Could not compile the probe source")
 
 
-class CompareShape(ast.NodeTransformer):
-    """Normalize comparison changes without normalizing their operands."""
+def probe_tests(tests):
+    if not 0 < len(tests) <= MAX_TESTS or sum(test["seconds"] for test in tests) > MAX_TEST_SECONDS:
+        return ()
+    ids = []
+    for test in tests:
+        path = test["file"]
+        names = test["id"].split("::")
+        if (
+            path in EXCLUDED_MODULES or len(names) != 3 or names[0] != path
+            or not all(name.isidentifier() for name in names[1:])
+            or not path.startswith("tests/") or not Path(path).name.startswith("test_")
+        ):
+            return ()
+        ids.append(test["id"])
+    return tuple(sorted(ids))
 
-    def visit_Compare(self, node):
-        self.generic_visit(node)
-        node.ops = [ast.Eq() for _ in node.ops]
-        return node
 
-    def visit_BoolOp(self, node):
-        self.generic_visit(node)
-        node.op = ast.And()
-        return node
-
-
-def replayable_optimizer_change(original, updated, changes):
-    if len(updated) != 1:
-        return False
-    path, source = next(iter(updated.items()))
-    module = PurePosixPath(path)
-    if module.parent.as_posix() != "sqlglot/optimizer" or module.stem not in RULE_ONLY_MODULES:
-        return False
-    change = changes[path]
-    if change.edit_runs != 1 or len(change.old_code) != 1 or len(change.new_code) != 1:
-        return False
-    old_line, _ = change.old_code[0]
-    try:
-        before = ast.parse(original[path], type_comments=True)
-        after = ast.parse(source, type_comments=True)
-    except (SyntaxError, ValueError, RecursionError):
-        return False
-    if not any(
-        isinstance(function, ast.FunctionDef) and function.lineno < old_line <= function.end_lineno
-        and any(isinstance(statement, ast.If) and statement.test.lineno <= old_line <= statement.test.end_lineno
-                for statement in ast.walk(function))
-        for function in before.body
-    ):
-        return False
-    return ast.dump(CompareShape().visit(before)) == ast.dump(CompareShape().visit(after))
+def child_cpu():
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
 
 
 class Verification:
-    def __init__(self, destination):
+    def __init__(self, destination, baseline=PROBE_SOURCE):
         self.destination = Path(destination)
-        self.elapsed = 0.0
-        self.ready = False
-        self.baseline_fingerprint = None
-        self.fingerprint_failed = False
-        if FINGERPRINT.is_file():
-            try:
-                digest = json.loads(FINGERPRINT.read_text())
-            except (OSError, ValueError):
-                digest = None
-            if isinstance(digest, str) and len(digest) == 64:
-                self.baseline_fingerprint = digest
-            else:
-                self.fingerprint_failed = True
-
-    def extract(self):
-        if not self.ready:
-            code = b"".join(SNAPSHOT.read_bytes().split())
-            with zipfile.ZipFile(io.BytesIO(base64.b85decode(code))) as archive:
-                archive.extractall(self.destination)
-            self.ready = True
+        self.baseline = baseline
+        self.working = self.destination / "source"
+        self.started_cpu = child_cpu()
+        self.probes = 0
 
     def prepare(self, patch, changes):
         if not changes or any(change.structural or not patchable(path) for path, change in changes.items()):
             return {}, {}
         try:
-            self.extract()
-            original = {path: (self.destination / path).read_text() for path in changes}
+            original = {path: (self.baseline / path).read_text() for path in changes}
             updated = apply_diff(patch.read_text(), original)
-        except (OSError, ValueError, zipfile.BadZipFile):
+        except (OSError, ValueError):
             return {}, {}
         if updated.keys() != original.keys():
             return {}, {}
@@ -205,70 +162,51 @@ class Verification:
         except (SyntaxError, ValueError, RecursionError):
             return False
 
-    def remove_passing(self, original, updated, tests, schedule_cost):
-        if not updated or self.elapsed + TIMEOUT > REPLAY_BUDGET or not tests:
-            return tests
-        candidates = [test for test in tests if eligible(test)][:MAX_REPLAY]
-        memory = next((test for test in tests if test["id"] == GENERATOR_MEMORY), None)
-        test_timeout = TIMEOUT
-        if memory:
-            candidates.insert(0, memory)
-            test_timeout = HEAVY_TIMEOUT
-        if self.elapsed + test_timeout > REPLAY_BUDGET:
-            return tests
-        candidate_ids = {test["id"] for test in candidates}
-        rest = [test for test in tests if test["id"] not in candidate_ids]
-        if not candidates or schedule_cost(tests) - schedule_cost(rest) < 0.35:
-            return tests
+    def all_pass(self, updated, test_ids):
+        remaining = PROBE_CPU_BUDGET - (child_cpu() - self.started_cpu)
+        if self.probes >= MAX_PROBES or remaining < MIN_PROBE_CPU:
+            return False
+        self.probes += 1
+        if not self.working.exists():
+            try:
+                # Copy once so the image's baseline stays read-only.
+                shutil.copytree(self.baseline, self.working)
+            except OSError:
+                self.probes = MAX_PROBES
+                return False
 
-        passed = self.run(original, updated, sorted(candidate_ids), test_timeout)
-        if not isinstance(passed, list) or not all(isinstance(node_id, str) for node_id in passed):
-            return tests
-        return [test for test in tests if test["id"] not in candidate_ids.intersection(passed)]
-
-    def remove_equivalent_benchmark(self, original, updated, changes, tests, schedule_cost):
-        if self.fingerprint_failed or not any(test["id"] == EXECUTOR_TPCDS for test in tests):
-            return tests
-        rest = [test for test in tests if test["id"] != EXECUTOR_TPCDS]
-        needed = FINGERPRINT_TIMEOUT * (1 if self.baseline_fingerprint else 2)
-        if self.elapsed + needed > REPLAY_BUDGET or schedule_cost(tests) - schedule_cost(rest) < needed:
-            return tests
-        if not replayable_optimizer_change(original, updated, changes):
-            return tests
-        arguments = ["--optimizer-fingerprint"]
-        if self.baseline_fingerprint is None:
-            self.baseline_fingerprint = self.run({}, {}, arguments, FINGERPRINT_TIMEOUT)
-            if not isinstance(self.baseline_fingerprint, str):
-                self.fingerprint_failed = True
-                return tests
-        actual = self.run(original, updated, arguments, FINGERPRINT_TIMEOUT)
-        return rest if actual == self.baseline_fingerprint else tests
-
-    def run(self, original, updated, args, timeout):
-        started = time.monotonic()
+        changed_paths = []
         try:
             for path, code in updated.items():
-                (self.destination / path).write_text(code)
+                changed = self.working / path
+                changed_paths.append(path)
+                # Skip baseline bytecode even for same-length replacements.
+                if changed.suffix == ".py":
+                    Path(cache_from_source(str(changed))).unlink(missing_ok=True)
+                changed.write_text(code)
             result = subprocess.run(
-                [sys.executable, "-B", "-S", str(RUNNER), str(self.destination), *args],
-                cwd=self.destination, capture_output=True, text=True, timeout=timeout,
+                [sys.executable, "-B", "-S", str(RUNNER), str(self.working),
+                 str(min(PROBE_CPU_LIMIT, remaining)), *test_ids],
+                cwd=self.working, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
                 stdin=subprocess.DEVNULL,
                 env={**os.environ, "PYTHONHASHSEED": "0", "SKIP_INTEGRATION": "0"},
             )
-            return json.loads(result.stdout) if result.returncode == 0 else None
+            return result.returncode == 0 and json.loads(result.stdout) is True
         except (OSError, subprocess.TimeoutExpired, ValueError):
-            return None
+            return False
         finally:
-            self.elapsed += time.monotonic() - started
-            for path, code in original.items():
-                (self.destination / path).write_text(code)
+            try:
+                for path in changed_paths:
+                    changed = self.working / path
+                    baseline = self.baseline / path
+                    shutil.copy2(baseline, changed)
+                    if changed.suffix == ".py":
+                        cached = Path(cache_from_source(str(baseline)))
+                        if cached.is_file():
+                            shutil.copy2(cached, cache_from_source(str(changed)))
+            except OSError:
+                self.probes = MAX_PROBES
 
 
 if __name__ == "__main__":
-    # Run during the Docker build with the grader's Python. This takes the
-    # baseline work out of the scored invocation.
-    with tempfile.TemporaryDirectory(prefix="blast-radius-prime-") as destination:
-        verification = Verification(destination)
-        verification.extract()
-        digest = verification.run({}, {}, ["--optimizer-fingerprint"], 20)
-        FINGERPRINT.write_text(json.dumps(digest) + "\n")
+    prepare_source(PROBE_SOURCE)

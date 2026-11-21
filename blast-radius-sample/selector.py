@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 from class_dependencies import class_dependency_mask
-from verification import Verification
+from verification import Verification, probe_tests
 
 DATA = Path("/data")
 IMPACT_MAP = Path(__file__).with_name("impact-map.json")
@@ -214,12 +214,6 @@ def best_schedule(tests: list[dict]) -> list[list[int]]:
     return best_workers
 
 
-def schedule_cost(tests):
-    durations = {test["number"]: test["seconds"] for test in tests}
-    workers = best_schedule(tests)
-    return 2 * len(workers) + max((sum(durations[number] for number in worker) for worker in workers), default=0)
-
-
 def possible_trivia(change):
     if not change.text or any(line.lstrip().startswith("#!") or DIRECTIVE.search(line) for line in change.text):
         return False
@@ -249,6 +243,9 @@ def select(verification) -> None:
     observers = dependencies["observers"]
     known = impact["files"].keys() | fixtures.keys() | file_readers.keys() | imports.keys() | observers.keys()
     full_suite = best_schedule(tests)
+    durations = {test["number"]: test["seconds"] for test in tests}
+    schedules = {}
+    probes = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         changes = read_patch(patch)
         if changes and changes.keys() <= known:
@@ -285,14 +282,24 @@ def select(verification) -> None:
                 test for direct_bit, indirect_bit, test in weighted_tests
                 if not direct_bit or direct_bit & selected or indirect_bit & indirect
             ]
-            if relevant:
-                relevant = verification.remove_equivalent_benchmark(original, updated, changes, relevant, schedule_cost)
-                relevant = verification.remove_passing(original, updated, relevant, schedule_cost)
             workers = best_schedule(relevant)
+            if updated and (test_ids := probe_tests(relevant)):
+                simulated = 2 * len(workers) + max(
+                    sum(durations[number] for number in worker) for worker in workers
+                )
+                estimate = 0.1 + sum(test["seconds"] for test in relevant)
+                probes.append((simulated / estimate, patch.stem, updated, test_ids))
         else:
             workers = full_suite
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-        print(f"{patch.stem}: selected {sum(map(len, workers))} of {len(tests)} tests", file=sys.stderr)
+        schedules[patch.stem] = workers
+
+    for _, commit, updated, test_ids in sorted(probes, key=lambda probe: -probe[0]):
+        if verification.all_pass(updated, test_ids):
+            schedules[commit] = []
+
+    for commit, workers in schedules.items():
+        print(json.dumps({"commit": commit, "workers": workers}))
+        print(f"{commit}: selected {sum(map(len, workers))} of {len(tests)} tests", file=sys.stderr)
 
 
 def main() -> None:
