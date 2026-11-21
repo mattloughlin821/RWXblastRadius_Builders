@@ -10,6 +10,7 @@ import sys
 DATA = Path("/data")
 IMPACT_MAP = Path(__file__).with_name("impact-map.json")
 FIXTURES = Path(__file__).with_name("optimizer-fixtures.json")
+DEPENDENCIES = Path(__file__).with_name("test-dependencies.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 DIFF_HEADER = re.compile(r"diff --git a/(\S+) b/(\S+)")
@@ -24,6 +25,7 @@ class FileChange:
     inserted: set[int] = field(default_factory=set)
     touched: set[int] = field(default_factory=set)
     text: list[str] = field(default_factory=list)
+    structural: bool = False
 
 
 def read_patch(patch: Path) -> dict[str, FileChange]:
@@ -48,7 +50,9 @@ def read_patch(patch: Path) -> dict[str, FileChange]:
             current = changes.setdefault(header[1], FileChange())
             old_line = None
         elif line.startswith(("new file mode ", "deleted file mode ", "GIT binary patch", "Binary files ")):
-            return {}
+            if current is None:
+                return {}
+            current.structural = True
         elif hunk := HUNK_HEADER.match(line):
             if current is None:
                 return {}
@@ -155,22 +159,41 @@ def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     impact = json.loads(IMPACT_MAP.read_text())
     weights = {node_id: 1 << index for index, node_id in enumerate(impact["test_ids"])}
-    weighted_tests = [(weights.get(test["id"], 0), test) for test in tests]
+    dependencies = json.loads(DEPENDENCIES.read_text())
+    dependency_weights = {node_id: 1 << index for index, node_id in enumerate(dependencies["test_ids"])}
+    weighted_tests = [(weights.get(test["id"], 0), dependency_weights.get(test["id"], 0), test) for test in tests]
     fixtures = {
         path: union(weights.get(node_id, 0) for node_id in node_ids)
         for path, node_ids in json.loads(FIXTURES.read_text()).items()
     }
     fixtures = {path: mask for path, mask in fixtures.items() if mask}
-    known = impact["files"].keys() | fixtures.keys()
+    file_readers = dependencies["fixtures"]
+    imports = dependencies["imports"]
+    observers = dependencies["observers"]
+    known = impact["files"].keys() | fixtures.keys() | file_readers.keys() | imports.keys() | observers.keys()
     full_suite = best_schedule(tests)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         changes = read_patch(patch)
         if changes and changes.keys() <= known:
-            selected = union(
-                fixtures[path] if path in fixtures else source_tests(path, change, impact)
-                for path, change in changes.items()
-            )
-            relevant = [test for bit, test in weighted_tests if not bit or bit & selected]
+            selected = 0
+            indirect = 0
+            for path, change in changes.items():
+                if path in fixtures or path in file_readers:
+                    selected |= fixtures.get(path, 0)
+                    indirect |= file_readers.get(path, 0)
+                elif path in impact["files"]:
+                    if change.structural:
+                        selected |= impact["masks"][impact["files"][path]["full"]]
+                        indirect |= imports.get(path, 0)
+                    else:
+                        selected |= source_tests(path, change, impact)
+                else:
+                    indirect |= imports.get(path, 0)
+                indirect |= observers.get(path, 0)
+            relevant = [
+                test for direct_bit, indirect_bit, test in weighted_tests
+                if not direct_bit or direct_bit & selected or indirect_bit & indirect
+            ]
             workers = best_schedule(relevant)
         else:
             workers = full_suite
