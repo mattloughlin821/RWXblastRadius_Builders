@@ -1,6 +1,7 @@
 """Generate the coverage map from a clean checkout of the pinned baseline."""
 
 import argparse
+import ast
 import json
 import os
 from pathlib import Path
@@ -55,17 +56,41 @@ def main():
 
     data = coverage.get_data()
     paths = {}
+    functions = {}
+    measured = sorted(recorder.measured)
+    index_by_id = {node_id: index for index, node_id in enumerate(measured)}
     for filename in data.measured_files():
         path = Path(filename).relative_to(checkout).as_posix()
+        contexts_by_line = data.contexts_by_lineno(filename)
         ids = {
             context
-            for contexts in data.contexts_by_lineno(filename).values()
+            for contexts in contexts_by_line.values()
             for context in contexts
             if context
         }
         if ids:
             paths[path] = sorted(ids)
-    output.write_text(json.dumps({"measured": sorted(recorder.measured), "paths": paths}, sort_keys=True) + "\n")
+        if not path.endswith(".py"):
+            continue
+        tree = ast.parse(Path(filename).read_bytes())
+        regions = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            indices = {
+                index_by_id[context]
+                for line in range(node.lineno, node.end_lineno + 1)
+                for context in contexts_by_line.get(line, ())
+                if context in index_by_id
+            }
+            regions.append([node.lineno, node.end_lineno, sorted(indices)])
+        if regions:
+            functions[path] = sorted(regions)
+    payload = json.dumps({"measured": measured, "paths": paths, "functions": functions},
+                         sort_keys=True, separators=(",", ":")) + "\n"
+    if len(payload.encode()) > 12_000_000:
+        raise SystemExit("Coverage map exceeds 12 MB. Existing map kept.")
+    output.write_text(payload)
     print(f"Mapped {len(paths)} source files across {len(recorder.measured)} tests to {output}")
     return 0
 
